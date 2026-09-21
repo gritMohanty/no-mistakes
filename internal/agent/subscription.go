@@ -15,7 +15,21 @@ import (
 // agent, including a configured fallback, is checked before it can execute.
 func subscriptionOnly() bool { return os.Getenv("GRIT_SUBSCRIPTION_POLICY") == "1" }
 
+func isSubscriptionPolicyEnv(key string) bool {
+	return strings.HasPrefix(key, "GRIT_SUBSCRIPTION_")
+}
+
 func validateSubscriptionAgent(name types.AgentName, args []string, opts Options) error {
+	for key, value := range opts.Environment.Set {
+		if isSubscriptionPolicyEnv(key) && value != os.Getenv(key) {
+			return fmt.Errorf("subscription policy refuses environment override %s", key)
+		}
+	}
+	for _, key := range opts.Environment.Unset {
+		if isSubscriptionPolicyEnv(key) {
+			return fmt.Errorf("subscription policy refuses environment removal %s", key)
+		}
+	}
 	for key, value := range opts.Environment.Set {
 		if value != "" && (strings.Contains(strings.ToUpper(key), "API_KEY") || key == "OPENAI_BASE_URL" || key == "OPENAI_API_BASE") {
 			return fmt.Errorf("subscription policy refuses environment override %s", key)
@@ -47,6 +61,9 @@ type subscriptionAgent struct {
 func (a *subscriptionAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
 	for _, entry := range append(os.Environ(), opts.Env...) {
 		key, value, _ := strings.Cut(entry, "=")
+		if isSubscriptionPolicyEnv(key) && value != os.Getenv(key) {
+			return nil, fmt.Errorf("subscription policy refuses environment override %s", key)
+		}
 		if value != "" && (strings.Contains(strings.ToUpper(key), "API_KEY") || key == "OPENAI_BASE_URL" || key == "OPENAI_API_BASE") {
 			return nil, fmt.Errorf("subscription policy refuses credential or endpoint override %s", key)
 		}

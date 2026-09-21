@@ -309,7 +309,10 @@ type AdmitPushResult struct {
 
 // HealthResult confirms the daemon is alive.
 type HealthResult struct {
-	Status string `json:"status"`
+	Status                 string `json:"status"`
+	SubscriptionPolicy     bool   `json:"subscription_policy,omitempty"`
+	SubscriptionPolicyFile string `json:"subscription_policy_file,omitempty"`
+	SubscriptionCheck      string `json:"subscription_check,omitempty"`
 }
 
 // ShutdownResult confirms shutdown was initiated.

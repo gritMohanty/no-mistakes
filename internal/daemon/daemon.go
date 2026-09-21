@@ -1074,6 +1074,9 @@ func migrateGateConfig(ctx context.Context, bareDir string) error {
 }
 
 func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func()) {
+	subscriptionPolicy := os.Getenv("GRIT_SUBSCRIPTION_POLICY") == "1"
+	subscriptionPolicyFile := os.Getenv("GRIT_SUBSCRIPTION_POLICY_FILE")
+	subscriptionCheck := os.Getenv("GRIT_SUBSCRIPTION_CHECK")
 	classify := func(ctx context.Context, cwd string, markerPresent, skipManagedGit bool) (gatecontext.Result, error) {
 		return (gatecontext.Inspector{DB: d, Paths: mgr.paths}).Inspect(ctx, gatecontext.Request{
 			CWD:            cwd,
@@ -1095,7 +1098,12 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 	}
 
 	srv.Handle(ipc.MethodHealth, func(_ context.Context, _ json.RawMessage) (interface{}, error) {
-		return &ipc.HealthResult{Status: "ok"}, nil
+		return &ipc.HealthResult{
+			Status:                 "ok",
+			SubscriptionPolicy:     subscriptionPolicy,
+			SubscriptionPolicyFile: subscriptionPolicyFile,
+			SubscriptionCheck:      subscriptionCheck,
+		}, nil
 	})
 
 	srv.Handle(ipc.MethodShutdown, func(ctx context.Context, _ json.RawMessage) (interface{}, error) {
