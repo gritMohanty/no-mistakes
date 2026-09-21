@@ -68,10 +68,17 @@ func (a *subscriptionAgent) Run(ctx context.Context, opts RunOpts) (*Result, err
 			return nil, fmt.Errorf("subscription policy refuses credential or endpoint override %s", key)
 		}
 	}
-	harness := strings.TrimPrefix(a.harness, "acp:")
-	check := exec.CommandContext(ctx, "node", os.Getenv("GRIT_SUBSCRIPTION_CHECK"), harness, a.model, a.effort, "0")
-	if out, err := check.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("subscription preflight failed: %w: %s", err, strings.TrimSpace(string(out)))
+	if err := runSubscriptionCheck(ctx, a.harness, a.model, a.effort); err != nil {
+		return nil, err
 	}
 	return a.Agent.Run(ctx, opts)
+}
+
+func runSubscriptionCheck(ctx context.Context, harness, model, effort string) error {
+	harness = strings.TrimPrefix(harness, "acp:")
+	check := exec.CommandContext(ctx, "node", os.Getenv("GRIT_SUBSCRIPTION_CHECK"), harness, model, effort, "0")
+	if out, err := check.CombinedOutput(); err != nil {
+		return fmt.Errorf("subscription preflight failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

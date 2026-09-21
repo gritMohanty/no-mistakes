@@ -181,6 +181,7 @@ var terminalNeedles = []struct {
 	{"quota_exceeded", "quota exceeded"},
 	{"quota exhausted", "quota exhausted"},
 	{"quota_exhausted", "quota exhausted"},
+	{"usage limit", "provider usage limit"},
 }
 
 // classifyTransient reports whether an error message looks like a transient

@@ -1313,6 +1313,16 @@ func NewWithOptions(name types.AgentName, bin string, extraArgs []string, opts O
 	if err := agentcfg.Validate(name, opts.Profile); err != nil {
 		return nil, err
 	}
+	// Managed subscription Cursor runs through its native headless CLI because
+	// Cursor's ACP server currently advertises only base model IDs. This keeps
+	// parameterized model pins such as Luna xhigh effective. Unmanaged Cursor
+	// and explicit non-Cursor ACP targets retain the existing acpx transport.
+	if subscriptionOnly() && name == types.AgentCursor {
+		if bin != "" && bin != "acpx" {
+			return nil, fmt.Errorf("subscription policy refuses custom Cursor ACP binary %q: managed agent:cursor uses native cursor-agent", bin)
+		}
+		return &cursorAgent{bin: "cursor-agent", model: opts.Profile.Model, effort: string(opts.Profile.Effort), subprocessContext: newSubprocessContext(opts.Environment)}, nil
+	}
 	if target, ok := types.ACPTargetFor(name); ok {
 		rawCommand := types.ACPRawCommand(target, opts.ACPRegistryOverrides)
 		return &acpxAgent{bin: bin, target: target, rawCommand: rawCommand, model: opts.Profile.Model, subprocessContext: newSubprocessContext(opts.Environment)}, nil
