@@ -286,6 +286,33 @@ var migrationStatements = []string{
 	`ALTER TABLE runs ADD COLUMN launch_released_at INTEGER`,
 	`CREATE TRIGGER IF NOT EXISTS runs_launch_bind_release_required_immutable BEFORE UPDATE OF launch_bind_release_required ON runs WHEN NEW.launch_bind_release_required IS NOT OLD.launch_bind_release_required BEGIN SELECT RAISE(ABORT, 'run launch bind-release requirement is immutable'); END`,
 	`CREATE TRIGGER IF NOT EXISTS runs_launch_released_at_immutable BEFORE UPDATE OF launch_released_at ON runs WHEN OLD.launch_released_at IS NOT NULL AND NEW.launch_released_at IS NOT OLD.launch_released_at BEGIN SELECT RAISE(ABORT, 'run launch release timestamp is immutable'); END`,
+	// A Captain no-run disposition is a durable tombstone, not a synthetic run.
+	// The primary key scopes it to the nonce's actual registered repository and
+	// branch. Cross-table triggers serialize its insertion against every run
+	// insert that carries a nonce, including ordinary/mode-mismatched launches.
+	`CREATE TABLE IF NOT EXISTS launch_nonce_fences (
+		repo_id TEXT NOT NULL,
+		branch TEXT NOT NULL,
+		launch_nonce TEXT NOT NULL,
+		submitted_head_sha TEXT NOT NULL,
+		validation_generation TEXT NOT NULL,
+		intent_digest TEXT NOT NULL,
+		task_id TEXT NOT NULL,
+		request_id TEXT NOT NULL,
+		attempt_id TEXT NOT NULL,
+		ticket_key TEXT NOT NULL,
+		project_id TEXT NOT NULL,
+		canonical_project_path TEXT NOT NULL,
+		execution_scope_version TEXT NOT NULL,
+		native_worktree_path TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY (repo_id, branch, launch_nonce)
+	)`,
+	`CREATE TRIGGER IF NOT EXISTS launch_nonce_fences_reject_existing_run BEFORE INSERT ON launch_nonce_fences WHEN EXISTS (SELECT 1 FROM runs WHERE repo_id = NEW.repo_id AND branch = NEW.branch AND launch_nonce = NEW.launch_nonce) BEGIN SELECT RAISE(ABORT, 'launch nonce already has a run'); END`,
+	`CREATE TRIGGER IF NOT EXISTS runs_reject_fenced_launch_nonce BEFORE INSERT ON runs WHEN NEW.launch_nonce IS NOT NULL AND EXISTS (SELECT 1 FROM launch_nonce_fences WHERE repo_id = NEW.repo_id AND branch = NEW.branch AND launch_nonce = NEW.launch_nonce) BEGIN SELECT RAISE(ABORT, 'launch nonce has a durable no-run fence'); END`,
+	`CREATE TRIGGER IF NOT EXISTS runs_update_reject_fenced_launch_nonce BEFORE UPDATE OF repo_id, branch, launch_nonce ON runs WHEN NEW.launch_nonce IS NOT NULL AND EXISTS (SELECT 1 FROM launch_nonce_fences WHERE repo_id = NEW.repo_id AND branch = NEW.branch AND launch_nonce = NEW.launch_nonce) BEGIN SELECT RAISE(ABORT, 'launch nonce has a durable no-run fence'); END`,
+	`CREATE TRIGGER IF NOT EXISTS launch_nonce_fences_immutable_update BEFORE UPDATE ON launch_nonce_fences BEGIN SELECT RAISE(ABORT, 'launch nonce fence is immutable'); END`,
+	`CREATE TRIGGER IF NOT EXISTS launch_nonce_fences_immutable_delete BEFORE DELETE ON launch_nonce_fences BEGIN SELECT RAISE(ABORT, 'launch nonce fence is immutable'); END`,
 	// Per-run PR target branch chosen by the operator (e.g. axi run
 	// --base-branch). Nullable: absent means fall back to repo config and the
 	// forge default branch.

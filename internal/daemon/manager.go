@@ -853,6 +853,17 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 	}
 	var receipt ipc.LaunchReceipt
 	_, err = m.withBranchLock(repo.ID, branch, func() (string, error) {
+		// A delayed push hook or fresh-run fallback for a nonce that Captain
+		// durably fenced must stop before cancelActiveRuns, worktree creation,
+		// or executor setup can affect another launch on this branch. The SQL
+		// insert trigger remains the cross-connection race guard at commit.
+		fence, err := m.db.GetLaunchNonceFence(repo.ID, branch, launchNonce)
+		if err != nil {
+			return "", err
+		}
+		if fence != nil {
+			return "", fmt.Errorf("launch nonce %q has a durable no-run fence", launchNonce)
+		}
 		existing, err := m.db.GetRunByLaunchNonce(repo.ID, branch, launchNonce)
 		if err != nil {
 			return "", err
@@ -1327,9 +1338,6 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		}
 	}
 
-	// Cancel any active run for this repo+branch.
-	m.cancelActiveRuns(repo.ID, branch)
-
 	storedIntent := intent
 	if source != db.RunIntentSourceRerun && launchNonce == "" {
 		storedIntent = strings.TrimSpace(storedIntent)
@@ -1358,6 +1366,11 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
 	}
+	// The run-row insert is the linearization point for a new launch. In
+	// particular, a durable no-run nonce fence rejects the insert before this
+	// launch can cancel a healthy run on the same branch. The new row has no
+	// cancel handle yet, so cancelActiveRuns only sees earlier tracked runs.
+	m.cancelActiveRuns(repo.ID, branch)
 	if inherited := strings.TrimSpace(inheritedPRURL); inherited != "" {
 		if err := m.db.UpdateRunPRURL(run.ID, inherited); err != nil {
 			m.db.UpdateRunError(run.ID, fmt.Sprintf("inherit PR URL: %s", err))

@@ -1139,6 +1139,7 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 			SubscriptionCheck:          subscriptionCheck,
 			SubscriptionFirstmateHome:  mgr.managedFirstmateHome,
 			SupportsHeldRunBindRelease: true,
+			SupportsLaunchNonceFence:   subscriptionPolicy && mgr.managedFirstmateHome != "",
 		}, nil
 	})
 
@@ -1333,6 +1334,21 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
 		result, err := mgr.HandleReleaseHeldRun(ctx, &p)
+		if err != nil {
+			return nil, err
+		}
+		return &result, nil
+	})
+
+	srv.Handle(ipc.MethodFenceLaunchNonce, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		if err := refuseNested(ctx, false); err != nil {
+			return nil, err
+		}
+		var p ipc.FenceLaunchNonceParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		result, err := mgr.HandleFenceLaunchNonce(ctx, &p)
 		if err != nil {
 			return nil, err
 		}

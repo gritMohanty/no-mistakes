@@ -15,6 +15,7 @@ const (
 	MethodStartFreshRun      = "start_fresh_run"
 	MethodClaimLaunchReceipt = "claim_launch_receipt"
 	MethodReleaseHeldRun     = "release_held_run"
+	MethodFenceLaunchNonce   = "fence_launch_nonce"
 	MethodGetRun             = "get_run"
 	MethodGetStepDiff        = "get_step_diff"
 	MethodGetRuns            = "get_runs"
@@ -112,6 +113,17 @@ type StartFreshRunParams struct {
 // independently verifies Captain's exact reservation, binding, and state.
 type ReleaseHeldRunParams struct {
 	RunID                string `json:"run_id"`
+	TaskID               string `json:"task_id"`
+	Branch               string `json:"branch"`
+	LaunchNonce          string `json:"launch_nonce"`
+	SubmittedHeadSHA     string `json:"submitted_head_sha"`
+	ValidationGeneration string `json:"validation_generation"`
+	IntentDigest         string `json:"intent_digest"`
+}
+
+// FenceLaunchNonceParams asks a managed daemon to durably exclude a run for
+// one exact Captain reservation after local launch setup has stopped.
+type FenceLaunchNonceParams struct {
 	TaskID               string `json:"task_id"`
 	Branch               string `json:"branch"`
 	LaunchNonce          string `json:"launch_nonce"`
@@ -284,6 +296,19 @@ type ReleaseHeldRunResult struct {
 	AlreadyReleased bool            `json:"already_released,omitempty"`
 }
 
+// FenceLaunchNonceResult confirms a durable no-run fence, or identifies the
+// exact existing run that won the insertion race. ExistingRunID is never a
+// successful fence acknowledgement.
+type FenceLaunchNonceResult struct {
+	RepoID        string `json:"repo_id,omitempty"`
+	Branch        string `json:"branch"`
+	LaunchNonce   string `json:"launch_nonce"`
+	Fenced        bool   `json:"fenced"`
+	AlreadyFenced bool   `json:"already_fenced,omitempty"`
+	CreatedAt     int64  `json:"created_at,omitempty"`
+	ExistingRunID string `json:"existing_run_id,omitempty"`
+}
+
 // GetRunResult wraps a single run.
 type GetRunResult struct {
 	Run *RunInfo `json:"run"`
@@ -338,6 +363,7 @@ type HealthResult struct {
 	SubscriptionCheck          string `json:"subscription_check,omitempty"`
 	SubscriptionFirstmateHome  string `json:"subscription_firstmate_home,omitempty"`
 	SupportsHeldRunBindRelease bool   `json:"supports_held_run_bind_release,omitempty"`
+	SupportsLaunchNonceFence   bool   `json:"supports_launch_nonce_fence,omitempty"`
 }
 
 // ShutdownResult confirms shutdown was initiated.

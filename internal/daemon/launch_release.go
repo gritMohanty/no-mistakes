@@ -75,6 +75,7 @@ type captainLaunchState struct {
 	TaskID      string `json:"taskId"`
 	LaunchNonce string `json:"launchNonce"`
 	Status      string `json:"status"`
+	Disposition string `json:"disposition"`
 	RunID       string `json:"runId"`
 }
 
