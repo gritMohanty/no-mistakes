@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -82,6 +83,12 @@ func Start(p *paths.Paths) error {
 		return err
 	}
 	if alive, _ := daemonHealthCheck(p); alive {
+		if managedSubscriptionPolicyActive() {
+			if err := requireManagedSubscriptionDaemon(p); err != nil {
+				return err
+			}
+			return nil
+		}
 		reloaded, err := reinstallManagedServiceIfChanged(p)
 		if err != nil {
 			return err
@@ -98,6 +105,12 @@ func Start(p *paths.Paths) error {
 	// stale stray (including a crash-looping managed unit) before starting.
 	if err := reconcileCollidingDaemons(p); err != nil {
 		return err
+	}
+	if managedSubscriptionPolicyActive() {
+		// A service manager cannot inherit the per-launch subscription marker and
+		// policy file. Keep managed no-mistakes daemons on the same explicit
+		// environment boundary as their Firstmate caller.
+		return startDetachedDaemon(p)
 	}
 	var managedErr error
 	if managed, err := installManagedService(p); err == nil {
@@ -525,33 +538,79 @@ func waitForProcessExit(pid int, timeout time.Duration) {
 	}
 }
 
-// IsRunning checks if the daemon is alive by sending a health check via IPC.
-func IsRunning(p *paths.Paths) (bool, error) {
-	return daemonHealthCheck(p)
-}
-
-func daemonIsRunningViaIPC(p *paths.Paths) (bool, error) {
+func daemonHealthResultViaIPC(p *paths.Paths) (ipc.HealthResult, error) {
 	client, err := ipc.Dial(p.Socket())
 	if err != nil {
 		_, statErr := os.Stat(p.Socket())
 		if os.IsNotExist(statErr) {
-			return false, nil
+			return ipc.HealthResult{}, nil
 		}
 		if ipc.IsConnectTimeout(err) {
-			return false, err
+			return ipc.HealthResult{}, err
 		}
 		if statErr != nil {
-			return false, fmt.Errorf("check daemon socket: %w", statErr)
+			return ipc.HealthResult{}, fmt.Errorf("check daemon socket: %w", statErr)
 		}
-		return false, fmt.Errorf("connect to daemon socket: %w", err)
+		return ipc.HealthResult{}, fmt.Errorf("connect to daemon socket: %w", err)
 	}
 	defer client.Close()
 
 	var result ipc.HealthResult
 	if err := client.CallWithTimeout(ipc.MethodHealth, &ipc.HealthParams{}, &result, ipc.DefaultDialTimeout); err != nil {
+		return ipc.HealthResult{}, err
+	}
+	return result, nil
+}
+
+func daemonIsRunningViaIPC(p *paths.Paths) (bool, error) {
+	result, err := daemonHealthResultViaIPC(p)
+	if err != nil {
 		return false, err
 	}
 	return result.Status == "ok", nil
+}
+
+// IsRunning checks if the daemon is alive by sending a health check via IPC.
+func IsRunning(p *paths.Paths) (bool, error) {
+	return daemonHealthCheck(p)
+}
+
+func managedSubscriptionPolicyActive() bool {
+	return os.Getenv("GRIT_SUBSCRIPTION_POLICY") == "1"
+}
+
+func requireManagedSubscriptionDaemon(p *paths.Paths) error {
+	result, err := daemonHealthResultViaIPC(p)
+	if err != nil {
+		return fmt.Errorf("inspect existing daemon policy: %w", err)
+	}
+	expectedFile := os.Getenv("GRIT_SUBSCRIPTION_POLICY_FILE")
+	if !filepath.IsAbs(expectedFile) {
+		return fmt.Errorf("managed subscription launch requires an absolute GRIT_SUBSCRIPTION_POLICY_FILE")
+	}
+	if !result.SubscriptionPolicy {
+		return fmt.Errorf("managed subscription launch refuses an existing unmanaged daemon; stop it before retrying")
+	}
+	if !samePhysicalPath(result.SubscriptionPolicyFile, expectedFile) {
+		return fmt.Errorf("managed subscription launch refuses daemon with policy file %q (want %q)", result.SubscriptionPolicyFile, expectedFile)
+	}
+	expectedCheck := os.Getenv("GRIT_SUBSCRIPTION_CHECK")
+	if !filepath.IsAbs(expectedCheck) {
+		return fmt.Errorf("managed subscription launch requires an absolute GRIT_SUBSCRIPTION_CHECK")
+	}
+	if !samePhysicalPath(result.SubscriptionCheck, expectedCheck) {
+		return fmt.Errorf("managed subscription launch refuses daemon with subscription check %q (want %q)", result.SubscriptionCheck, expectedCheck)
+	}
+	if homeInput := os.Getenv("FM_HOME"); homeInput != "" {
+		expectedHome, err := canonicalPhysicalPath(homeInput)
+		if err != nil {
+			return fmt.Errorf("managed subscription launch requires a resolvable absolute FM_HOME: %w", err)
+		}
+		if result.SubscriptionFirstmateHome != expectedHome {
+			return fmt.Errorf("managed subscription launch refuses daemon pinned to Firstmate home %q (want %q)", result.SubscriptionFirstmateHome, expectedHome)
+		}
+	}
+	return nil
 }
 
 // Stop sends a shutdown request to the running daemon and waits for it to exit.
@@ -893,11 +952,17 @@ func upsertEnv(env []string, key, value string) []string {
 
 // EnsureDaemon starts the daemon if it's not already running.
 func EnsureDaemon(p *paths.Paths) error {
+	if managedSubscriptionPolicyActive() && !filepath.IsAbs(os.Getenv("GRIT_SUBSCRIPTION_POLICY_FILE")) {
+		return fmt.Errorf("managed subscription launch requires an absolute GRIT_SUBSCRIPTION_POLICY_FILE")
+	}
 	alive, err := daemonHealthCheck(p)
 	if err != nil {
 		return fmt.Errorf("%w (run 'no-mistakes daemon start' to recover)", err)
 	}
 	if alive {
+		if managedSubscriptionPolicyActive() {
+			return requireManagedSubscriptionDaemon(p)
+		}
 		return nil
 	}
 	return daemonStart(p)

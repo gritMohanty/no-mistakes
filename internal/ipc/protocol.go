@@ -14,6 +14,8 @@ const (
 	MethodResolvePiProfile   = "resolve_pi_profile"
 	MethodStartFreshRun      = "start_fresh_run"
 	MethodClaimLaunchReceipt = "claim_launch_receipt"
+	MethodReleaseHeldRun     = "release_held_run"
+	MethodFenceLaunchNonce   = "fence_launch_nonce"
 	MethodGetRun             = "get_run"
 	MethodGetStepDiff        = "get_step_diff"
 	MethodGetRuns            = "get_runs"
@@ -81,6 +83,7 @@ type PushReceivedParams struct {
 	Intent               string           `json:"intent,omitempty"`
 	LaunchNonce          string           `json:"launch_nonce,omitempty"`
 	ValidationGeneration string           `json:"validation_generation,omitempty"`
+	RequireBindRelease   bool             `json:"require_bind_release,omitempty"`
 	PRBaseBranch         string           `json:"pr_base_branch,omitempty"`
 	// ReconciledPreviousHead is the head a reconciled private mirror branch
 	// carried before the pusher archived and removed it. The push re-creates the
@@ -102,7 +105,31 @@ type StartFreshRunParams struct {
 	Intent               string           `json:"intent"`
 	LaunchNonce          string           `json:"launch_nonce"`
 	ValidationGeneration string           `json:"validation_generation"`
+	RequireBindRelease   bool             `json:"require_bind_release,omitempty"`
 	PRBaseBranch         string           `json:"pr_base_branch,omitempty"`
+}
+
+// ReleaseHeldRunParams asks the daemon to release one held run after it
+// independently verifies Captain's exact reservation, binding, and state.
+type ReleaseHeldRunParams struct {
+	RunID                string `json:"run_id"`
+	TaskID               string `json:"task_id"`
+	Branch               string `json:"branch"`
+	LaunchNonce          string `json:"launch_nonce"`
+	SubmittedHeadSHA     string `json:"submitted_head_sha"`
+	ValidationGeneration string `json:"validation_generation"`
+	IntentDigest         string `json:"intent_digest"`
+}
+
+// FenceLaunchNonceParams asks a managed daemon to durably exclude a run for
+// one exact Captain reservation after local launch setup has stopped.
+type FenceLaunchNonceParams struct {
+	TaskID               string `json:"task_id"`
+	Branch               string `json:"branch"`
+	LaunchNonce          string `json:"launch_nonce"`
+	SubmittedHeadSHA     string `json:"submitted_head_sha"`
+	ValidationGeneration string `json:"validation_generation"`
+	IntentDigest         string `json:"intent_digest"`
 }
 
 // ClaimLaunchReceiptParams identifies one exact opaque receipt binding.
@@ -116,6 +143,7 @@ type ClaimLaunchReceiptParams struct {
 	SubmittedHeadSHA     string `json:"submitted_head_sha"`
 	ValidationGeneration string `json:"validation_generation"`
 	IntentDigest         string `json:"intent_digest"`
+	RequireBindRelease   bool   `json:"require_bind_release,omitempty"`
 	PRBaseBranch         string `json:"pr_base_branch,omitempty"`
 }
 
@@ -261,6 +289,26 @@ type ClaimLaunchReceiptResult struct {
 	Receipt *LaunchReceipt `json:"receipt,omitempty"`
 }
 
+type ReleaseHeldRunResult struct {
+	RunID           string          `json:"run_id"`
+	ReleasedAt      int64           `json:"released_at"`
+	Status          types.RunStatus `json:"status"`
+	AlreadyReleased bool            `json:"already_released,omitempty"`
+}
+
+// FenceLaunchNonceResult confirms a durable no-run fence, or identifies the
+// exact existing run that won the insertion race. ExistingRunID is never a
+// successful fence acknowledgement.
+type FenceLaunchNonceResult struct {
+	RepoID        string `json:"repo_id,omitempty"`
+	Branch        string `json:"branch"`
+	LaunchNonce   string `json:"launch_nonce"`
+	Fenced        bool   `json:"fenced"`
+	AlreadyFenced bool   `json:"already_fenced,omitempty"`
+	CreatedAt     int64  `json:"created_at,omitempty"`
+	ExistingRunID string `json:"existing_run_id,omitempty"`
+}
+
 // GetRunResult wraps a single run.
 type GetRunResult struct {
 	Run *RunInfo `json:"run"`
@@ -309,7 +357,13 @@ type AdmitPushResult struct {
 
 // HealthResult confirms the daemon is alive.
 type HealthResult struct {
-	Status string `json:"status"`
+	Status                     string `json:"status"`
+	SubscriptionPolicy         bool   `json:"subscription_policy,omitempty"`
+	SubscriptionPolicyFile     string `json:"subscription_policy_file,omitempty"`
+	SubscriptionCheck          string `json:"subscription_check,omitempty"`
+	SubscriptionFirstmateHome  string `json:"subscription_firstmate_home,omitempty"`
+	SupportsHeldRunBindRelease bool   `json:"supports_held_run_bind_release,omitempty"`
+	SupportsLaunchNonceFence   bool   `json:"supports_launch_nonce_fence,omitempty"`
 }
 
 // ShutdownResult confirms shutdown was initiated.

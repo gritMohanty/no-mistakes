@@ -1292,13 +1292,36 @@ func New(name types.AgentName, bin string, extraArgs []string) (Agent, error) {
 }
 
 // NewWithOptions creates an agent by name with additional backend-specific options.
-func NewWithOptions(name types.AgentName, bin string, extraArgs []string, opts Options) (Agent, error) {
+func NewWithOptions(name types.AgentName, bin string, extraArgs []string, opts Options) (created Agent, err error) {
+	if subscriptionOnly() {
+		if err := validateSubscriptionAgent(name, extraArgs, opts); err != nil {
+			return nil, err
+		}
+		if name == types.AgentCodex {
+			extraArgs = append(append([]string{}, extraArgs...), "-c", "model_provider=\"openai\"", "-c", "forced_login_method=\"chatgpt\"")
+		}
+		defer func() {
+			if err == nil && created != nil {
+				created = &subscriptionAgent{Agent: created, harness: string(name), model: opts.Profile.Model, effort: string(opts.Profile.Effort)}
+			}
+		}()
+	}
 	// Fail closed on a knob this harness cannot express. Config load performs
 	// the same check, but this is the funnel every caller reaches - including
 	// eval replay and programmatic callers that build a profile directly - so a
 	// run can never report a model or effort it did not actually use.
 	if err := agentcfg.Validate(name, opts.Profile); err != nil {
 		return nil, err
+	}
+	// Managed subscription Cursor runs through its native headless CLI because
+	// Cursor's ACP server currently advertises only base model IDs. This keeps
+	// parameterized model pins such as Luna xhigh effective. Unmanaged Cursor
+	// and explicit non-Cursor ACP targets retain the existing acpx transport.
+	if subscriptionOnly() && name == types.AgentCursor {
+		if bin != "" && bin != "acpx" {
+			return nil, fmt.Errorf("subscription policy refuses custom Cursor ACP binary %q: managed agent:cursor uses native cursor-agent", bin)
+		}
+		return &cursorAgent{bin: "cursor-agent", model: opts.Profile.Model, effort: string(opts.Profile.Effort), subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	}
 	if target, ok := types.ACPTargetFor(name); ok {
 		rawCommand := types.ACPRawCommand(target, opts.ACPRegistryOverrides)

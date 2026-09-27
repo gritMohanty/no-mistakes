@@ -43,15 +43,21 @@ var fetchRecoveredRemoteBranch = git.FetchRemoteBranch
 
 // RunManager tracks active pipeline executors and manages run lifecycle.
 type RunManager struct {
-	mu           sync.Mutex
-	executors    map[string]*pipeline.Executor      // runID → executor
-	cancels      map[string]context.CancelCauseFunc // runID → cancel function with cause
-	dones        map[string]chan struct{}           // runID → closed when goroutine exits
-	wg           sync.WaitGroup                     // tracks background run goroutines
-	shuttingDown atomic.Bool                        // prevents new runs during shutdown
-	db           *db.DB
-	paths        *paths.Paths
-	steps        StepFactory
+	mu                            sync.Mutex
+	executors                     map[string]*pipeline.Executor      // runID → executor
+	cancels                       map[string]context.CancelCauseFunc // runID → cancel function with cause
+	dones                         map[string]chan struct{}           // runID → closed when goroutine exits
+	wg                            sync.WaitGroup                     // tracks background run goroutines
+	shuttingDown                  atomic.Bool                        // prevents new runs during shutdown
+	db                            *db.DB
+	paths                         *paths.Paths
+	steps                         StepFactory
+	managedFirstmateHome          string
+	managedSubscriptionPolicyFile string
+	managedSubscriptionCheck      string
+	managedSubscriptionPolicy     bool
+	heldRuns                      map[string]*heldRunControl
+	heldRunHooks                  *heldRunTestHooks
 
 	branchLocks sync.Map // repoID+"/"+branch → *sync.Mutex
 
@@ -91,6 +97,7 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 		db:            database,
 		paths:         p,
 		steps:         stepFactory,
+		heldRuns:      make(map[string]*heldRunControl),
 		subscribers:   make(map[string][]*eventMailbox),
 		stateRevs:     make(map[string]int64),
 		completedRuns: make(map[string]bool),
@@ -787,7 +794,7 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 		baseSHA = strings.TrimSpace(params.ReconciledPreviousHead)
 	}
 	if params.LaunchNonce != "" {
-		receipt, err := m.startFreshLaunch(ctx, repo, branch, params.New, baseSHA, params.Gate, params.SkipSteps, params.Intent, params.LaunchNonce, params.ValidationGeneration, params.PRBaseBranch, "push", params.PiProfile)
+		receipt, err := m.startFreshLaunch(ctx, repo, branch, params.New, baseSHA, params.Gate, params.SkipSteps, params.Intent, params.LaunchNonce, params.ValidationGeneration, params.PRBaseBranch, "push", params.RequireBindRelease, params.PiProfile)
 		if err != nil {
 			return "", err
 		}
@@ -806,13 +813,13 @@ func (m *RunManager) HandleStartFreshRun(ctx context.Context, params *ipc.StartF
 	if repo == nil {
 		return ipc.LaunchReceipt{}, fmt.Errorf("unknown repo %s", params.RepoID)
 	}
-	return m.startFreshLaunch(ctx, repo, params.Branch, params.HeadSHA, "", m.paths.RepoDir(repo.ID), params.SkipSteps, params.Intent, params.LaunchNonce, params.ValidationGeneration, params.PRBaseBranch, "fresh", params.PiProfile)
+	return m.startFreshLaunch(ctx, repo, params.Branch, params.HeadSHA, "", m.paths.RepoDir(repo.ID), params.SkipSteps, params.Intent, params.LaunchNonce, params.ValidationGeneration, params.PRBaseBranch, "fresh", params.RequireBindRelease, params.PiProfile)
 }
 
 // startFreshLaunch owns proof identity under the branch lock. A nonce may
 // replay only its immutable submitted-head, generation, and persisted-intent
 // digest. It must never fall back to ordinary same-head reattachment.
-func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, gateDir string, skipSteps []types.StepName, intent, launchNonce, validationGeneration, prBaseBranch, trigger string, profiles ...*agentcfg.PiProfile) (ipc.LaunchReceipt, error) {
+func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, gateDir string, skipSteps []types.StepName, intent, launchNonce, validationGeneration, prBaseBranch, trigger string, requireBindRelease bool, profiles ...*agentcfg.PiProfile) (ipc.LaunchReceipt, error) {
 	request := agentcfg.OptionalPiProfile(profiles)
 	if err := request.ValidateRequest(); err != nil {
 		return ipc.LaunchReceipt{}, err
@@ -831,17 +838,40 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 	if strings.TrimSpace(intent) == "" {
 		return ipc.LaunchReceipt{}, fmt.Errorf("intent is required with launch_nonce")
 	}
+	if requireBindRelease && m.managedFirstmateHome == "" {
+		return ipc.LaunchReceipt{}, fmt.Errorf("bind-release launch requires a daemon pinned to a managed Firstmate home")
+	}
 	// Proof launches bind exactly the bytes persisted. Ordinary AXI intent
 	// retains its historical normalization.
 	persistedIntent := intent
 	requestDigest := digestIntent(persistedIntent)
+	claimReceipt := func() (*db.Run, bool, error) {
+		if requireBindRelease {
+			return m.db.ClaimHeldLaunchReceipt(repo.ID, branch, launchNonce, headSHA, validationGeneration, requestDigest, storedPRBaseBranch, request)
+		}
+		return m.db.ClaimLaunchReceipt(repo.ID, branch, launchNonce, headSHA, validationGeneration, requestDigest, storedPRBaseBranch)
+	}
 	var receipt ipc.LaunchReceipt
 	_, err = m.withBranchLock(repo.ID, branch, func() (string, error) {
+		// A delayed push hook or fresh-run fallback for a nonce that Captain
+		// durably fenced must stop before cancelActiveRuns, worktree creation,
+		// or executor setup can affect another launch on this branch. The SQL
+		// insert trigger remains the cross-connection race guard at commit.
+		fence, err := m.db.GetLaunchNonceFence(repo.ID, branch, launchNonce)
+		if err != nil {
+			return "", err
+		}
+		if fence != nil {
+			return "", fmt.Errorf("launch nonce %q has a durable no-run fence", launchNonce)
+		}
 		existing, err := m.db.GetRunByLaunchNonce(repo.ID, branch, launchNonce)
 		if err != nil {
 			return "", err
 		}
 		if existing != nil {
+			if existing.LaunchBindReleaseRequired != requireBindRelease {
+				return "", fmt.Errorf("conflicting launch_nonce: bind-release mode differs from run pin")
+			}
 			if !existing.PiProfile.Matches(request) {
 				return "", fmt.Errorf("conflicting launch_nonce: Pi profile differs from run pin")
 			}
@@ -864,7 +894,7 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 				receipt = replayed
 				return existing.ID, nil
 			}
-			claimedRun, claimed, err := m.db.ClaimLaunchReceipt(repo.ID, branch, launchNonce, headSHA, validationGeneration, requestDigest, storedPRBaseBranch)
+			claimedRun, claimed, err := claimReceipt()
 			if err != nil {
 				return "", err
 			}
@@ -901,7 +931,7 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 				inheritedPRURL = inheritablePRURL(runs[0])
 			}
 		}
-		runID, err := m.startRunWithIntentSourceLocked(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, persistedIntent, db.RunIntentSourceAgent, launchNonce, validationGeneration, requestDigest, storedPRBaseBranch, inheritedPRURL, request)
+		runID, err := m.startRunWithIntentSourceLocked(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, persistedIntent, db.RunIntentSourceAgent, launchNonce, validationGeneration, requestDigest, storedPRBaseBranch, inheritedPRURL, requireBindRelease, request)
 		if err != nil {
 			return "", err
 		}
@@ -915,7 +945,7 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 				return "", err
 			}
 		} else {
-			claimedRun, claimed, err := m.db.ClaimLaunchReceipt(repo.ID, branch, launchNonce, headSHA, validationGeneration, requestDigest, storedPRBaseBranch)
+			claimedRun, claimed, err := claimReceipt()
 			if err != nil {
 				return "", err
 			}
@@ -1242,7 +1272,7 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 // override, and RunIntentSourceRerun for inherited explicit intent.
 func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, prBaseBranch, inheritedPRURL string, profiles ...*agentcfg.PiProfile) (string, error) {
 	return m.withBranchLock(repo.ID, branch, func() (string, error) {
-		return m.startRunWithIntentSourceLocked(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, source, "", "", "", prBaseBranch, inheritedPRURL, profiles...)
+		return m.startRunWithIntentSourceLocked(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, source, "", "", "", prBaseBranch, inheritedPRURL, false, profiles...)
 	})
 }
 
@@ -1257,7 +1287,7 @@ func (m *RunManager) withBranchLock(repoID, branch string, action func() (string
 
 // startRunWithIntentSourceLocked performs run creation while the caller owns
 // the repository/branch lock. Proof fields are empty for ordinary launches.
-func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, launchNonce, validationGeneration, intentDigest, prBaseBranch, inheritedPRURL string, profiles ...*agentcfg.PiProfile) (string, error) {
+func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, launchNonce, validationGeneration, intentDigest, prBaseBranch, inheritedPRURL string, requireBindRelease bool, profiles ...*agentcfg.PiProfile) (string, error) {
 	branchRole := telemetryBranchRole(branch, repo.DefaultBranch)
 	trackStartFailure := func(stage string) {
 		telemetry.Track("run", telemetry.Fields{
@@ -1308,9 +1338,6 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		}
 	}
 
-	// Cancel any active run for this repo+branch.
-	m.cancelActiveRuns(repo.ID, branch)
-
 	storedIntent := intent
 	if source != db.RunIntentSourceRerun && launchNonce == "" {
 		storedIntent = strings.TrimSpace(storedIntent)
@@ -1329,11 +1356,21 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		return "", err
 	}
 
-	run, err := m.db.InsertRunWithIntentAndLaunchNonce(repo.ID, branch, headSHA, baseSHA, runIntent, launchNonce, validationGeneration, intentDigest, storedPRBaseBranch, pin)
+	var run *db.Run
+	if requireBindRelease {
+		run, err = m.db.InsertHeldRunWithIntentAndLaunchNonce(repo.ID, branch, headSHA, baseSHA, runIntent, launchNonce, validationGeneration, intentDigest, storedPRBaseBranch, pin)
+	} else {
+		run, err = m.db.InsertRunWithIntentAndLaunchNonce(repo.ID, branch, headSHA, baseSHA, runIntent, launchNonce, validationGeneration, intentDigest, storedPRBaseBranch, pin)
+	}
 	if err != nil {
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
 	}
+	// The run-row insert is the linearization point for a new launch. In
+	// particular, a durable no-run nonce fence rejects the insert before this
+	// launch can cancel a healthy run on the same branch. The new row has no
+	// cancel handle yet, so cancelActiveRuns only sees earlier tracked runs.
+	m.cancelActiveRuns(repo.ID, branch)
 	if inherited := strings.TrimSpace(inheritedPRURL); inherited != "" {
 		if err := m.db.UpdateRunPRURL(run.ID, inherited); err != nil {
 			m.db.UpdateRunError(run.ID, fmt.Sprintf("inherit PR URL: %s", err))
@@ -1552,10 +1589,17 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 
 	// Track executor.
 	done := make(chan struct{})
+	var held *heldRunControl
+	if requireBindRelease {
+		held = newHeldRunControl()
+	}
 	m.mu.Lock()
 	m.executors[run.ID] = executor
 	m.cancels[run.ID] = cancel
 	m.dones[run.ID] = done
+	if held != nil {
+		m.heldRuns[run.ID] = held
+	}
 	m.mu.Unlock()
 
 	// Background goroutine now owns worktree cleanup.
@@ -1610,8 +1654,38 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 			delete(m.executors, run.ID)
 			delete(m.cancels, run.ID)
 			delete(m.dones, run.ID)
+			delete(m.heldRuns, run.ID)
 			m.mu.Unlock()
 		}()
+
+		if held != nil {
+			select {
+			case <-held.released:
+			case <-runCtx.Done():
+			}
+			held.mu.Lock()
+			cancelled := held.cancelled || runCtx.Err() != nil
+			held.mu.Unlock()
+			if cancelled {
+				m.finishHeldRunBeforeExecute(run, runCtx)
+				return
+			}
+			if !held.wasReleased() {
+				run.Status = types.RunFailed
+				message := "held launch ended without a durable bind release"
+				run.Error = &message
+				if err := m.db.UpdateRunErrorStatus(run.ID, message, types.RunFailed); err != nil {
+					slog.Error("failed to persist held-run release failure", "run_id", run.ID, "error", err)
+				}
+				return
+			}
+		}
+		if held != nil && m.heldRunHooks != nil && m.heldRunHooks.beforeExecute != nil {
+			m.heldRunHooks.beforeExecute(run.ID)
+		}
+		if held != nil && !m.beginHeldRunExecutor(run, runCtx, held) {
+			return
+		}
 
 		if err := executor.Execute(runCtx, run, repo, wtDir); err != nil {
 			fields := telemetry.Fields{
@@ -1857,8 +1931,8 @@ func (m *RunManager) Shutdown() {
 	}
 	m.mu.Unlock()
 
-	for id, cancel := range cancels {
-		cancel(fmt.Errorf("daemon shutting down"))
+	for id := range cancels {
+		m.cancelRun(id, fmt.Errorf("daemon shutting down"))
 		slog.Info("cancelled run on shutdown", "run_id", id)
 	}
 
@@ -1876,16 +1950,31 @@ func (m *RunManager) Shutdown() {
 
 // HandleCancel stops an active run and propagates cancellation to the executor.
 func (m *RunManager) HandleCancel(runID string) error {
-	m.mu.Lock()
-	cancel, ok := m.cancels[runID]
-	m.mu.Unlock()
-
-	if !ok {
+	if !m.cancelRun(runID, fmt.Errorf(types.RunCancelReasonAbortedByUser)) {
 		return fmt.Errorf("no active run %s", runID)
 	}
-
-	cancel(fmt.Errorf(types.RunCancelReasonAbortedByUser))
 	return nil
+}
+
+func (m *RunManager) cancelRun(runID string, cause error) bool {
+	m.mu.Lock()
+	cancel, ok := m.cancels[runID]
+	held := m.heldRuns[runID]
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+	if held != nil {
+		held.mu.Lock()
+		if !held.started {
+			held.cancelled = true
+		}
+		cancel(cause)
+		held.mu.Unlock()
+	} else {
+		cancel(cause)
+	}
+	return true
 }
 
 // cancelActiveRuns cancels any in-progress runs for the given repo+branch
@@ -1910,14 +1999,14 @@ func (m *RunManager) cancelActiveRuns(repoID, branch string) {
 		}
 
 		m.mu.Lock()
-		cancel, ok := m.cancels[run.ID]
+		_, ok := m.cancels[run.ID]
 		done := m.dones[run.ID]
 		m.mu.Unlock()
 		if !ok {
 			continue
 		}
 
-		cancel(fmt.Errorf(types.RunCancelReasonSuperseded))
+		m.cancelRun(run.ID, fmt.Errorf(types.RunCancelReasonSuperseded))
 		slog.Info("cancelled active run", "run_id", run.ID, "repo_id", repoID, "branch", branch)
 		if done != nil {
 			toWait = append(toWait, done)

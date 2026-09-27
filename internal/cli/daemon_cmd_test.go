@@ -136,6 +136,22 @@ func TestProofAndPRBaseBranchPushOptionsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRequireBindReleasePushOption(t *testing.T) {
+	option := formatRequireBindReleasePushOption()
+	if option != "no-mistakes.require-bind-release=1" {
+		t.Fatalf("formatRequireBindReleasePushOption() = %q", option)
+	}
+	if got, err := parseRequireBindReleasePushOptions([]string{option, option}); err != nil || !got {
+		t.Fatalf("parseRequireBindReleasePushOptions() = %t, %v, want true", got, err)
+	}
+	if got, err := parseRequireBindReleasePushOptions(nil); err != nil || got {
+		t.Fatalf("parseRequireBindReleasePushOptions(nil) = %t, %v, want false", got, err)
+	}
+	if _, err := parseRequireBindReleasePushOptions([]string{"no-mistakes.require-bind-release=0"}); err == nil {
+		t.Fatal("expected malformed bind-release option to fail")
+	}
+}
+
 func TestReconciledPreviousHeadPushOptionRoundTrip(t *testing.T) {
 	head := "1234567890abcdef1234567890abcdef12345678"
 	opt := formatReconciledPreviousHeadPushOption(head)

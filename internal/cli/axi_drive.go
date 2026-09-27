@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -119,6 +121,7 @@ func newAxiRunCmd() *cobra.Command {
 	var intent string
 	var launchNonce string
 	var validationGeneration string
+	var requireBindRelease bool
 	var baseBranch string
 	var model, effort string
 	var wait time.Duration
@@ -176,7 +179,7 @@ func newAxiRunCmd() *cobra.Command {
 				if err != nil {
 					return emitError(cmd, 2, err.Error())
 				}
-				return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, launchNonce, validationGeneration, wait, profile)
+				return runAxiRunWithBindRelease(cmd, autoYes, skipSteps, intent, baseBranch, launchNonce, validationGeneration, requireBindRelease, wait, profile)
 			})
 		},
 	}
@@ -185,6 +188,7 @@ func newAxiRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&intent, "intent", "", "what the user set out to accomplish (not a description of the diff); used instead of inferring from transcripts (required to start a run)")
 	cmd.Flags().StringVar(&launchNonce, "launch-nonce", "", "opaque nonce for a daemon-bound pre-drive launch receipt")
 	cmd.Flags().StringVar(&validationGeneration, "validation-generation", "", "opaque generation bound to --launch-nonce proof mode")
+	cmd.Flags().BoolVar(&requireBindRelease, "require-bind-release", false, "hold execution until Captain binds this exact launch receipt")
 	cmd.Flags().StringVar(&baseBranch, "base-branch", "", "integration branch to open the PR against for this run only (overrides pr.base_branch)")
 	bindAxiWaitFlag(cmd, &wait)
 	bindPiProfileFlags(cmd, &model, &effort)
@@ -196,12 +200,19 @@ func runAxiRun(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, int
 }
 
 func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration string, wait time.Duration, profiles ...*agentcfg.PiProfile) error {
+	return runAxiRunWithBindRelease(cmd, autoYes, skipSteps, intent, baseBranch, launchNonce, validationGeneration, false, wait, profiles...)
+}
+
+func runAxiRunWithBindRelease(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration string, requireBindRelease bool, wait time.Duration, profiles ...*agentcfg.PiProfile) error {
 	profile := agentcfg.OptionalPiProfile(profiles)
 	if err := profile.ValidateRequest(); err != nil {
 		return emitError(cmd, 2, err.Error())
 	}
 	if err := validateAxiWait(wait); err != nil {
 		return emitError(cmd, 2, err.Error(), "Pass a positive duration such as --wait 8m")
+	}
+	if requireBindRelease && launchNonce == "" {
+		return emitError(cmd, 2, "--require-bind-release requires --launch-nonce and --validation-generation")
 	}
 	ctx := cmd.Context()
 	driveCtx, cancel, err := boundAxiWait(ctx, wait)
@@ -214,6 +225,11 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		return emitError(cmd, 1, err.Error(), repoInitHelp(err)...)
 	}
 	defer env.close()
+	if requireBindRelease {
+		if err := requireHeldRunBindReleaseCapability(env.client); err != nil {
+			return emitError(cmd, 2, err.Error())
+		}
+	}
 
 	branch, err := git.CurrentBranch(ctx, ".")
 	if err != nil {
@@ -241,7 +257,7 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		if strings.TrimSpace(validationGeneration) == "" {
 			return emitError(cmd, 2, "--validation-generation is required with --launch-nonce")
 		}
-		receipt, err := claimLaunchReceipt(env.client, env.repo.ID, branch, launchNonce, headSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, profile)
+		receipt, err := claimLaunchReceiptWithMode(env.client, env.repo.ID, branch, launchNonce, headSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, requireBindRelease, profile)
 		if err != nil {
 			return emitError(cmd, 1, fmt.Sprintf("claim launch receipt: %v", err))
 		}
@@ -307,7 +323,7 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		}
 		var err error
 		if launchNonce != "" {
-			launchReceipt, err = triggerProofRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch, launchNonce, validationGeneration, profile)
+			launchReceipt, err = triggerProofRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch, launchNonce, validationGeneration, requireBindRelease, profile)
 			if err == nil {
 				runID = launchReceipt.RunID
 			}
@@ -333,6 +349,56 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		return emitError(cmd, 1, fmt.Sprintf("drive run: %v", err))
 	}
 	return renderDriveResult(cmd, run, ciReady)
+}
+
+func requireHeldRunBindReleaseCapability(client *ipc.Client) error {
+	if os.Getenv("GRIT_SUBSCRIPTION_POLICY") != "1" {
+		return fmt.Errorf("--require-bind-release requires a managed subscription policy")
+	}
+	policyFile := os.Getenv("GRIT_SUBSCRIPTION_POLICY_FILE")
+	check := os.Getenv("GRIT_SUBSCRIPTION_CHECK")
+	home := os.Getenv("FM_HOME")
+	if !filepath.IsAbs(policyFile) || !filepath.IsAbs(check) || !filepath.IsAbs(home) {
+		return fmt.Errorf("--require-bind-release requires absolute managed policy, check, and FM_HOME paths")
+	}
+	policyFile, err := filepath.EvalSymlinks(policyFile)
+	if err != nil {
+		return fmt.Errorf("resolve managed policy file: %w", err)
+	}
+	check, err = filepath.EvalSymlinks(check)
+	if err != nil {
+		return fmt.Errorf("resolve managed subscription check: %w", err)
+	}
+	home, err = filepath.EvalSymlinks(home)
+	if err != nil {
+		return fmt.Errorf("resolve Firstmate home: %w", err)
+	}
+	var health ipc.HealthResult
+	if err := client.CallWithTimeout(ipc.MethodHealth, &ipc.HealthParams{}, &health, ipc.DefaultDialTimeout); err != nil {
+		return fmt.Errorf("verify daemon bind-release capability: %w", err)
+	}
+	if health.Status != "ok" || !health.SupportsHeldRunBindRelease {
+		return fmt.Errorf("daemon does not advertise held-run bind-release support; refusing to launch")
+	}
+	if !health.SubscriptionPolicy {
+		return fmt.Errorf("daemon is not using the managed subscription policy required for bind-release")
+	}
+	if !sameResolvedPath(health.SubscriptionPolicyFile, policyFile) || !sameResolvedPath(health.SubscriptionCheck, check) {
+		return fmt.Errorf("daemon managed subscription policy does not match this launch environment")
+	}
+	if !sameResolvedPath(health.SubscriptionFirstmateHome, home) {
+		return fmt.Errorf("daemon Firstmate home does not match this launch environment")
+	}
+	return nil
+}
+
+func sameResolvedPath(left, right string) bool {
+	if !filepath.IsAbs(left) || !filepath.IsAbs(right) {
+		return false
+	}
+	l, leftErr := filepath.EvalSymlinks(left)
+	r, rightErr := filepath.EvalSymlinks(right)
+	return leftErr == nil && rightErr == nil && filepath.Clean(l) == filepath.Clean(r)
 }
 
 func digestLaunchIntent(intent string) string {
@@ -624,10 +690,15 @@ func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []typ
 }
 
 func claimLaunchReceipt(client *ipc.Client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, baseBranch string, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
+	return claimLaunchReceiptWithMode(client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, baseBranch, false, profiles...)
+}
+
+func claimLaunchReceiptWithMode(client *ipc.Client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, baseBranch string, requireBindRelease bool, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
 	var result ipc.ClaimLaunchReceiptResult
 	if err := client.Call(ipc.MethodClaimLaunchReceipt, &ipc.ClaimLaunchReceiptParams{
 		RepoID: repoID, Branch: branch, LaunchNonce: launchNonce, PiProfile: agentcfg.OptionalPiProfile(profiles),
 		SubmittedHeadSHA: submittedHeadSHA, ValidationGeneration: validationGeneration, IntentDigest: intentDigest, PRBaseBranch: baseBranch,
+		RequireBindRelease: requireBindRelease,
 	}, &result); err != nil {
 		return nil, err
 	}
@@ -640,7 +711,7 @@ func claimLaunchReceipt(client *ipc.Client, repoID, branch, launchNonce, submitt
 // triggerProofRun captures the immutable submitted commit and waits only for
 // the matching nonce-bound receipt. Ordinary active-run heuristics never prove
 // strict launch identity.
-func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration string, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
+func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration string, requireBindRelease bool, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
 	profile := agentcfg.OptionalPiProfile(profiles)
 	pushOptions := append(formatSkipPushOptions(skipSteps), formatPiProfilePushOptions(profile)...)
 	pushOptions = append(pushOptions,
@@ -648,6 +719,9 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 		formatLaunchNoncePushOption(launchNonce),
 		formatValidationGenerationPushOption(validationGeneration),
 	)
+	if requireBindRelease {
+		pushOptions = append(pushOptions, formatRequireBindReleasePushOption())
+	}
 	if opt := formatPRBaseBranchPushOption(baseBranch); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
@@ -661,7 +735,7 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 		}
 		return nil, fmt.Errorf("push %q to gate: %w", branch, pushErr)
 	}
-	if receipt, err := waitForLaunchReceipt(ctx, env.client, env.repo.ID, branch, launchNonce, headSHA, validationGeneration, intent, baseBranch, triggerWaitTimeout, profile); err != nil {
+	if receipt, err := waitForLaunchReceiptWithMode(ctx, env.client, env.repo.ID, branch, launchNonce, headSHA, validationGeneration, intent, baseBranch, requireBindRelease, triggerWaitTimeout, profile); err != nil {
 		return nil, err
 	} else if receipt != nil {
 		return receipt, nil
@@ -670,6 +744,7 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 	if err := env.client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
 		RepoID: env.repo.ID, Branch: branch, HeadSHA: headSHA, SkipSteps: skipSteps,
 		Intent: intent, LaunchNonce: launchNonce, ValidationGeneration: validationGeneration, PRBaseBranch: baseBranch, PiProfile: profile,
+		RequireBindRelease: requireBindRelease,
 	}, &result); err != nil {
 		return nil, fmt.Errorf("start fresh run: %w", err)
 	}
@@ -677,12 +752,16 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 }
 
 func waitForLaunchReceipt(ctx context.Context, client *ipc.Client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intent, baseBranch string, timeout time.Duration, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
+	return waitForLaunchReceiptWithMode(ctx, client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intent, baseBranch, false, timeout, profiles...)
+}
+
+func waitForLaunchReceiptWithMode(ctx context.Context, client *ipc.Client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intent, baseBranch string, requireBindRelease bool, timeout time.Duration, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	poll := time.NewTicker(150 * time.Millisecond)
 	defer poll.Stop()
 	for {
-		receipt, err := claimLaunchReceipt(client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, profiles...)
+		receipt, err := claimLaunchReceiptWithMode(client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, requireBindRelease, profiles...)
 		if err != nil {
 			return nil, err
 		}

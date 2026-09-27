@@ -79,6 +79,12 @@ type Run struct {
 	LaunchValidationGeneration *string
 	LaunchIntentDigest         *string
 	LaunchReceiptClaimedAt     *int64
+	// LaunchBindReleaseRequired is immutable and true only for a managed
+	// launch that cannot enter Executor.Execute until Captain releases it.
+	LaunchBindReleaseRequired bool
+	// LaunchReleasedAt is the durable one-shot release permission. A timestamp
+	// proves permission was granted; it does not prove the agent actually ran.
+	LaunchReleasedAt *int64
 	// PRBaseBranch is a per-run override for the integration/PR target branch.
 	// It is set by the operator (axi run --base-branch) and takes precedence
 	// over pr.base_branch in repo config for this run only.
@@ -89,7 +95,7 @@ type Run struct {
 	UpdatedAt int64
 }
 
-const runColumns = `id, repo_id, branch, head_sha, base_sha, worktree_dir, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, launch_receipt_claimed_at, pr_base_branch, pi_profile, created_at, updated_at`
+const runColumns = `id, repo_id, branch, head_sha, base_sha, worktree_dir, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, launch_receipt_claimed_at, COALESCE(launch_bind_release_required, 0), launch_released_at, pr_base_branch, pi_profile, created_at, updated_at`
 
 func scanRun(row interface {
 	Scan(...any) error
@@ -102,6 +108,7 @@ func scanRun(row interface {
 		&r.CustodyReturnedAt, &r.Error, &r.AwaitingAgentSince, &r.ParkedMS,
 		&r.Intent, &r.IntentSource, &r.IntentSessionID, &r.IntentScore,
 		&r.LaunchNonce, &r.LaunchValidationGeneration, &r.LaunchIntentDigest, &r.LaunchReceiptClaimedAt,
+		&r.LaunchBindReleaseRequired, &r.LaunchReleasedAt,
 		&r.PRBaseBranch, &r.PiProfile,
 		&r.CreatedAt, &r.UpdatedAt,
 	)
@@ -130,6 +137,19 @@ func (d *DB) InsertRunWithIntent(repoID, branch, headSHA, baseSHA string, intent
 // partial unique index remains the duplicate defense across daemon processes;
 // callers additionally serialize selection under their branch lock.
 func (d *DB) InsertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA string, intent *RunIntent, launchNonce, validationGeneration, intentDigest, prBaseBranch string, profiles ...*agentcfg.PiProfile) (*Run, error) {
+	return d.insertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA, intent, launchNonce, validationGeneration, intentDigest, prBaseBranch, false, profiles...)
+}
+
+// InsertHeldRunWithIntentAndLaunchNonce creates a proof-bound run that cannot
+// start until a separate exact-identity bind-release operation succeeds.
+func (d *DB) InsertHeldRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA string, intent *RunIntent, launchNonce, validationGeneration, intentDigest, prBaseBranch string, profiles ...*agentcfg.PiProfile) (*Run, error) {
+	if strings.TrimSpace(launchNonce) == "" || strings.TrimSpace(validationGeneration) == "" || strings.TrimSpace(intentDigest) == "" {
+		return nil, fmt.Errorf("held launch requires a launch nonce, validation generation, and intent digest")
+	}
+	return d.insertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA, intent, launchNonce, validationGeneration, intentDigest, prBaseBranch, true, profiles...)
+}
+
+func (d *DB) insertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA string, intent *RunIntent, launchNonce, validationGeneration, intentDigest, prBaseBranch string, bindReleaseRequired bool, profiles ...*agentcfg.PiProfile) (*Run, error) {
 	pin := agentcfg.OptionalPiProfile(profiles)
 	if err := pin.Validate(); err != nil {
 		return nil, err
@@ -138,18 +158,19 @@ func (d *DB) InsertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA 
 	version := buildinfo.CurrentVersion()
 	buildSHA := buildinfo.Commit
 	r := &Run{
-		ID:                 newID(),
-		RepoID:             repoID,
-		Branch:             branch,
-		HeadSHA:            headSHA,
-		BaseSHA:            baseSHA,
-		SubmittedHeadSHA:   &headSHA,
-		NoMistakesVersion:  &version,
-		NoMistakesBuildSHA: &buildSHA,
-		PiProfile:          pin,
-		Status:             types.RunPending,
-		CreatedAt:          ts,
-		UpdatedAt:          ts,
+		ID:                        newID(),
+		RepoID:                    repoID,
+		Branch:                    branch,
+		HeadSHA:                   headSHA,
+		BaseSHA:                   baseSHA,
+		SubmittedHeadSHA:          &headSHA,
+		NoMistakesVersion:         &version,
+		NoMistakesBuildSHA:        &buildSHA,
+		PiProfile:                 pin,
+		Status:                    types.RunPending,
+		LaunchBindReleaseRequired: bindReleaseRequired,
+		CreatedAt:                 ts,
+		UpdatedAt:                 ts,
 	}
 	if launchNonce != "" {
 		r.LaunchNonce = &launchNonce
@@ -167,13 +188,65 @@ func (d *DB) InsertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA 
 		r.PRBaseBranch = &prBaseBranch
 	}
 	_, err := d.sql.Exec(
-		`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, status, pr_state, intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, pr_base_branch, pi_profile, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, headSHA, r.NoMistakesVersion, r.NoMistakesBuildSHA, r.Status, r.Intent, r.IntentSource, r.IntentSessionID, r.IntentScore, r.LaunchNonce, r.LaunchValidationGeneration, r.LaunchIntentDigest, r.PRBaseBranch, r.PiProfile, r.CreatedAt, r.UpdatedAt,
+		`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, status, pr_state, intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, launch_bind_release_required, pr_base_branch, pi_profile, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, headSHA, r.NoMistakesVersion, r.NoMistakesBuildSHA, r.Status, r.Intent, r.IntentSource, r.IntentSessionID, r.IntentScore, r.LaunchNonce, r.LaunchValidationGeneration, r.LaunchIntentDigest, r.LaunchBindReleaseRequired, r.PRBaseBranch, r.PiProfile, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert run: %w", err)
 	}
 	return r, nil
+}
+
+// ReleaseHeldRun atomically grants the one-shot permission for an exact
+// proof-bound held run to enter Executor.Execute. Replaying an exact proof
+// returns the original timestamp and current run status without restarting it.
+func (d *DB) ReleaseHeldRun(runID, branch, launchNonce, validationGeneration, submittedHeadSHA, intentDigest string) (*Run, bool, error) {
+	if strings.TrimSpace(runID) == "" || strings.TrimSpace(branch) == "" || strings.TrimSpace(launchNonce) == "" || strings.TrimSpace(validationGeneration) == "" || strings.TrimSpace(submittedHeadSHA) == "" || strings.TrimSpace(intentDigest) == "" {
+		return nil, false, fmt.Errorf("complete held-run release identity is required")
+	}
+
+	ts := now()
+	var released Run
+	err := scanRun(d.sql.QueryRow(
+		`UPDATE runs
+		 SET launch_released_at = ?, updated_at = ?
+		 WHERE id = ? AND branch = ? AND launch_nonce = ?
+		   AND launch_validation_generation = ? AND submitted_head_sha = ?
+		   AND launch_intent_digest = ? AND launch_bind_release_required = 1
+		   AND launch_receipt_claimed_at IS NOT NULL
+		   AND launch_released_at IS NULL AND status = ?
+		 RETURNING `+runColumns,
+		ts, ts, runID, branch, launchNonce, validationGeneration, submittedHeadSHA, intentDigest, types.RunPending,
+	), &released)
+	if err == nil {
+		return &released, false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, false, fmt.Errorf("release held run: %w", err)
+	}
+
+	current, err := d.GetRun(runID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !runMatchesHeldRelease(current, branch, launchNonce, validationGeneration, submittedHeadSHA, intentDigest) {
+		return nil, false, fmt.Errorf("run %q does not match the held launch release identity", runID)
+	}
+	if current.LaunchReceiptClaimedAt == nil {
+		return nil, false, fmt.Errorf("run %q launch receipt has not been claimed", runID)
+	}
+	if current.LaunchReleasedAt != nil {
+		return current, true, nil
+	}
+	return nil, false, fmt.Errorf("run %q is not releasable in status %q", runID, current.Status)
+}
+
+func runMatchesHeldRelease(run *Run, branch, launchNonce, validationGeneration, submittedHeadSHA, intentDigest string) bool {
+	return run != nil && run.LaunchBindReleaseRequired && run.Branch == branch &&
+		run.LaunchNonce != nil && *run.LaunchNonce == launchNonce &&
+		run.LaunchValidationGeneration != nil && *run.LaunchValidationGeneration == validationGeneration &&
+		run.SubmittedHeadSHA != nil && *run.SubmittedHeadSHA == submittedHeadSHA &&
+		run.LaunchIntentDigest != nil && *run.LaunchIntentDigest == intentDigest
 }
 
 // RunWorktree is one run's recorded worktree placement, identified by the run
@@ -332,6 +405,16 @@ func (d *DB) GetRunByLaunchNonce(repoID, branch, launchNonce string) (*Run, erro
 // including an explicit PR base branch, is part of the UPDATE predicate, so a
 // conflicting observer cannot consume `created`.
 func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch string, profiles ...*agentcfg.PiProfile) (*Run, bool, error) {
+	return d.claimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, false, profiles...)
+}
+
+// ClaimHeldLaunchReceipt claims a receipt only when its immutable row requires
+// the pre-execution Captain bind-release barrier.
+func (d *DB) ClaimHeldLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch string, profiles ...*agentcfg.PiProfile) (*Run, bool, error) {
+	return d.claimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, true, profiles...)
+}
+
+func (d *DB) claimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch string, requireBindRelease bool, profiles ...*agentcfg.PiProfile) (*Run, bool, error) {
 	request := agentcfg.OptionalPiProfile(profiles)
 	if err := request.ValidateRequest(); err != nil {
 		return nil, false, err
@@ -341,18 +424,23 @@ func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, v
 		model, effort = request.Model, string(request.Effort)
 	}
 	prBaseBranch = strings.TrimSpace(prBaseBranch)
+	bindReleaseRequired := 0
+	if requireBindRelease {
+		bindReleaseRequired = 1
+	}
 	for {
 		r := &Run{}
 		err := scanRun(d.sql.QueryRow(
 			`UPDATE runs SET launch_receipt_claimed_at = ?
 			 WHERE repo_id = ? AND branch = ? AND launch_nonce = ?
 			   AND submitted_head_sha = ? AND launch_validation_generation = ? AND launch_intent_digest = ?
+			   AND launch_bind_release_required = ?
 			   AND (? = '' OR pr_base_branch = ?)
 			   AND (? = '' OR json_extract(pi_profile, '$.model') = ?)
 			   AND (? = '' OR json_extract(pi_profile, '$.effort') = ?)
 			   AND launch_receipt_claimed_at IS NULL
 			 RETURNING `+runColumns,
-			now(), repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, prBaseBranch, model, model, effort, effort,
+			now(), repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, bindReleaseRequired, prBaseBranch, prBaseBranch, model, model, effort, effort,
 		), r)
 		if err == nil {
 			return r, true, nil
@@ -364,7 +452,7 @@ func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, v
 		if err != nil {
 			return nil, false, err
 		}
-		if r == nil || !r.PiProfile.Matches(request) || r.LaunchReceiptClaimedAt != nil ||
+		if r == nil || r.LaunchBindReleaseRequired != requireBindRelease || !r.PiProfile.Matches(request) || r.LaunchReceiptClaimedAt != nil ||
 			r.SubmittedHeadSHA == nil || *r.SubmittedHeadSHA != submittedHeadSHA ||
 			r.LaunchValidationGeneration == nil || *r.LaunchValidationGeneration != validationGeneration ||
 			r.LaunchIntentDigest == nil || *r.LaunchIntentDigest != intentDigest ||
@@ -473,6 +561,31 @@ func (d *DB) UpdateRunStatus(id string, status types.RunStatus) error {
 		return fmt.Errorf("update run status: %w", err)
 	}
 	return nil
+}
+
+// StartReleasedHeldRun atomically transitions a held launch into the executor
+// start state only while the exact one-shot release remains durable.
+func (d *DB) StartReleasedHeldRun(id string) (*Run, bool, error) {
+	ts := now()
+	var started Run
+	err := scanRun(d.sql.QueryRow(
+		`UPDATE runs SET status = ?, updated_at = ?
+		 WHERE id = ? AND status = ? AND launch_bind_release_required = 1
+		   AND launch_receipt_claimed_at IS NOT NULL AND launch_released_at IS NOT NULL
+		 RETURNING `+runColumns,
+		types.RunRunning, ts, id, types.RunPending,
+	), &started)
+	if err == nil {
+		return &started, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, false, fmt.Errorf("start released held run: %w", err)
+	}
+	current, err := d.GetRun(id)
+	if err != nil {
+		return nil, false, err
+	}
+	return current, false, nil
 }
 
 // UpdateRunPRURL sets the PR URL on a run. A delayed PR-step write must not

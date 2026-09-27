@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -79,6 +80,47 @@ func TestPrepareDaemonEnvironment_PreservesExistingNMHome(t *testing.T) {
 	}
 	if got := os.Getenv("PATH"); got != "/resolved/bin" {
 		t.Fatalf("PATH = %q, want %q", got, "/resolved/bin")
+	}
+}
+
+func TestPrepareDaemonEnvironmentRestoresAndPinsManagedFirstmateEnvironment(t *testing.T) {
+	home, policyFile, checkFile := configureManagedSubscriptionTestEnv(t)
+	t.Setenv("PATH", os.Getenv("PATH"))
+
+	oldApply := applyShellEnvToProcess
+	defer func() { applyShellEnvToProcess = oldApply }()
+	applyShellEnvToProcess = func(excluded ...string) error {
+		for _, key := range []string{"FM_HOME", "GRIT_SUBSCRIPTION_POLICY", "GRIT_SUBSCRIPTION_POLICY_FILE", "GRIT_SUBSCRIPTION_CHECK"} {
+			found := false
+			for _, candidate := range excluded {
+				found = found || candidate == key
+			}
+			if !found {
+				t.Errorf("managed environment variable %s was not protected from login-shell import", key)
+			}
+			if err := os.Setenv(key, "/login-shell/override"); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if err := prepareDaemonEnvironment(); err != nil {
+		t.Fatal(err)
+	}
+	canonicalHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"FM_HOME":                       canonicalHome,
+		"GRIT_SUBSCRIPTION_POLICY":      "1",
+		"GRIT_SUBSCRIPTION_POLICY_FILE": policyFile,
+		"GRIT_SUBSCRIPTION_CHECK":       checkFile,
+	} {
+		if got := os.Getenv(key); got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
 	}
 }
 

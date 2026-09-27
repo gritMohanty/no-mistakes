@@ -65,6 +65,10 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if len(os.Args) >= 3 && os.Args[1] == "daemon" && os.Args[2] == "run" {
+		_, _ = os.Stderr.WriteString("daemon test binary invoked as a helper without NM_DAEMON_HELPER_PROCESS; refusing to recursively run the test suite\n")
+		os.Exit(2)
+	}
 	// The post-receive hook embeds os.Executable() as NM_BIN. In tests that
 	// path is the test binary itself, so every `git push` to a bare gate
 	// would re-enter TestMain and run the whole daemon test suite inside
@@ -200,7 +204,13 @@ func startTestDaemonWithSteps(t *testing.T, sf StepFactory) (*paths.Paths, *db.D
 
 	// Keep daemon tests hermetic now that the default config auto-detects agents.
 	mockClaude := writeMockClaude(t, t.TempDir())
-	configYAML := "agent: claude\nagent_path_override:\n  claude: " + mockClaude + "\n"
+	agentName := "claude"
+	modelConfig := ""
+	if managedSubscriptionPolicyActive() {
+		agentName = "codex"
+		modelConfig = "agent_config:\n  codex:\n    model: gpt-5.4\n    effort: high\n"
+	}
+	configYAML := "agent: " + agentName + "\nagent_path_override:\n  " + agentName + ": " + mockClaude + "\n" + modelConfig
 	if err := os.WriteFile(p.ConfigFile(), []byte(configYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}

@@ -117,6 +117,13 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 			if (launchNonce == "") != (validationGeneration == "") {
 				return fmt.Errorf("launch_nonce and validation_generation push options must be supplied together")
 			}
+			requireBindRelease, err := parseRequireBindReleasePushOptions(pushOptions)
+			if err != nil {
+				return err
+			}
+			if requireBindRelease && launchNonce == "" {
+				return fmt.Errorf("bind-release push option requires launch_nonce and validation_generation")
+			}
 			prBaseBranch, err := parsePRBaseBranchPushOptions(pushOptions)
 			if err != nil {
 				return err
@@ -155,6 +162,7 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 				Intent:                 intent,
 				LaunchNonce:            launchNonce,
 				ValidationGeneration:   validationGeneration,
+				RequireBindRelease:     requireBindRelease,
 				PRBaseBranch:           prBaseBranch,
 				PiProfile:              piProfile,
 				ReconciledPreviousHead: reconciledPreviousHead,
@@ -225,6 +233,7 @@ const intentPushOptionPrefix = "no-mistakes.intent="
 const (
 	launchNoncePushOptionPrefix          = "no-mistakes.launch-nonce="
 	validationGenerationPushOptionPrefix = "no-mistakes.validation-generation="
+	requireBindReleasePushOptionPrefix   = "no-mistakes.require-bind-release="
 )
 
 func formatLaunchNoncePushOption(nonce string) string {
@@ -233,6 +242,23 @@ func formatLaunchNoncePushOption(nonce string) string {
 
 func formatValidationGenerationPushOption(generation string) string {
 	return formatOpaquePushOption(validationGenerationPushOptionPrefix, generation)
+}
+
+func formatRequireBindReleasePushOption() string { return requireBindReleasePushOptionPrefix + "1" }
+
+func parseRequireBindReleasePushOptions(options []string) (bool, error) {
+	found := false
+	for _, option := range options {
+		value, ok := strings.CutPrefix(option, requireBindReleasePushOptionPrefix)
+		if !ok {
+			continue
+		}
+		if value != "1" {
+			return false, fmt.Errorf("invalid bind-release push option")
+		}
+		found = true
+	}
+	return found, nil
 }
 
 func formatOpaquePushOption(prefix, value string) string {
