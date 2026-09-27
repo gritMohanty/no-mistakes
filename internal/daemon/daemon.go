@@ -114,6 +114,13 @@ func Run() (retErr error) {
 
 func prepareDaemonEnvironment() error {
 	nmHome := os.Getenv("NM_HOME")
+	managedPolicy := os.Getenv("GRIT_SUBSCRIPTION_POLICY") == "1"
+	managedEnvironment := map[string]string{}
+	if managedPolicy {
+		for _, key := range []string{"FM_HOME", "GRIT_SUBSCRIPTION_POLICY", "GRIT_SUBSCRIPTION_POLICY_FILE", "GRIT_SUBSCRIPTION_CHECK"} {
+			managedEnvironment[key] = os.Getenv(key)
+		}
+	}
 	for _, key := range []string{
 		"CLAUDECODE",
 		"CLAUDE_CODE_ENTRYPOINT",
@@ -125,8 +132,22 @@ func prepareDaemonEnvironment() error {
 			return fmt.Errorf("unset %s: %w", key, err)
 		}
 	}
-	if err := applyLoginShellEnvironment(applyShellEnvToProcess, nmHome); err != nil {
+	if err := applyLoginShellEnvironment(applyShellEnvToProcess, nmHome, managedPolicy); err != nil {
 		return fmt.Errorf("apply login shell environment: %w", err)
+	}
+	for key, value := range managedEnvironment {
+		if err := os.Setenv(key, value); err != nil {
+			return fmt.Errorf("restore managed subscription environment %s: %w", key, err)
+		}
+	}
+	if managedPolicy {
+		pin, err := resolveManagedSubscriptionPin()
+		if err != nil {
+			return err
+		}
+		if err := os.Setenv("FM_HOME", pin.Home); err != nil {
+			return fmt.Errorf("pin FM_HOME: %w", err)
+		}
 	}
 	logDaemonPathSummary()
 	return nil
@@ -135,11 +156,16 @@ func prepareDaemonEnvironment() error {
 // applyLoginShellEnvironment applies a login-shell probe to the process and
 // keeps the service-supplied NM_HOME authoritative over anything the shell's
 // rc files export.
-func applyLoginShellEnvironment(apply func(...string) error, nmHome string) error {
+
+func applyLoginShellEnvironment(apply func(...string) error, nmHome string, managedPolicy ...bool) error {
+	var protected []string
 	if nmHome != "" {
-		return apply("NM_HOME")
+		protected = append(protected, "NM_HOME")
 	}
-	return apply()
+	if len(managedPolicy) > 0 && managedPolicy[0] {
+		protected = append(protected, "FM_HOME", "GRIT_SUBSCRIPTION_POLICY", "GRIT_SUBSCRIPTION_POLICY_FILE", "GRIT_SUBSCRIPTION_CHECK")
+	}
+	return apply(protected...)
 }
 
 // logDaemonPathSummary records the effective PATH at daemon startup so that
@@ -236,7 +262,15 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 	agent.SetServerPIDsDir(p.ServerPIDsDir())
 	defer agent.SetServerPIDsDir("")
 
+	pin, err := resolveManagedSubscriptionPin()
+	if err != nil {
+		return err
+	}
 	mgr := NewRunManager(d, p, stepFactory)
+	mgr.managedSubscriptionPolicy = pin.Enabled
+	mgr.managedFirstmateHome = pin.Home
+	mgr.managedSubscriptionPolicyFile = pin.PolicyFile
+	mgr.managedSubscriptionCheck = pin.Check
 
 	// Publish process identity as soon as the singleton lock is held. Startup
 	// callers can now distinguish a launched child from IPC readiness and detect
@@ -1074,9 +1108,9 @@ func migrateGateConfig(ctx context.Context, bareDir string) error {
 }
 
 func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func()) {
-	subscriptionPolicy := os.Getenv("GRIT_SUBSCRIPTION_POLICY") == "1"
-	subscriptionPolicyFile := os.Getenv("GRIT_SUBSCRIPTION_POLICY_FILE")
-	subscriptionCheck := os.Getenv("GRIT_SUBSCRIPTION_CHECK")
+	subscriptionPolicy := mgr.managedSubscriptionPolicy
+	subscriptionPolicyFile := mgr.managedSubscriptionPolicyFile
+	subscriptionCheck := mgr.managedSubscriptionCheck
 	classify := func(ctx context.Context, cwd string, markerPresent, skipManagedGit bool) (gatecontext.Result, error) {
 		return (gatecontext.Inspector{DB: d, Paths: mgr.paths}).Inspect(ctx, gatecontext.Request{
 			CWD:            cwd,
@@ -1099,10 +1133,12 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 
 	srv.Handle(ipc.MethodHealth, func(_ context.Context, _ json.RawMessage) (interface{}, error) {
 		return &ipc.HealthResult{
-			Status:                 "ok",
-			SubscriptionPolicy:     subscriptionPolicy,
-			SubscriptionPolicyFile: subscriptionPolicyFile,
-			SubscriptionCheck:      subscriptionCheck,
+			Status:                     "ok",
+			SubscriptionPolicy:         subscriptionPolicy,
+			SubscriptionPolicyFile:     subscriptionPolicyFile,
+			SubscriptionCheck:          subscriptionCheck,
+			SubscriptionFirstmateHome:  mgr.managedFirstmateHome,
+			SupportsHeldRunBindRelease: true,
 		}, nil
 	})
 
@@ -1255,12 +1291,21 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		if err != nil {
 			return nil, err
 		}
-		run, claimed, err := d.ClaimLaunchReceipt(p.RepoID, p.Branch, p.LaunchNonce, p.SubmittedHeadSHA, p.ValidationGeneration, p.IntentDigest, prBaseBranch, p.PiProfile)
+		var run *db.Run
+		var claimed bool
+		if p.RequireBindRelease {
+			run, claimed, err = d.ClaimHeldLaunchReceipt(p.RepoID, p.Branch, p.LaunchNonce, p.SubmittedHeadSHA, p.ValidationGeneration, p.IntentDigest, prBaseBranch, p.PiProfile)
+		} else {
+			run, claimed, err = d.ClaimLaunchReceipt(p.RepoID, p.Branch, p.LaunchNonce, p.SubmittedHeadSHA, p.ValidationGeneration, p.IntentDigest, prBaseBranch, p.PiProfile)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("claim launch receipt: %w", err)
 		}
 		if run == nil {
 			return &ipc.ClaimLaunchReceiptResult{}, nil
+		}
+		if run.LaunchBindReleaseRequired != p.RequireBindRelease {
+			return nil, fmt.Errorf("conflicting launch_nonce: bind-release mode differs from run pin")
 		}
 		if !run.PiProfile.Matches(p.PiProfile) {
 			return nil, fmt.Errorf("conflicting launch_nonce: Pi profile differs from run pin")
@@ -1277,6 +1322,21 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 			return nil, fmt.Errorf("conflicting launch_nonce is already bound to a different validation generation, submitted head, or intent")
 		}
 		return &ipc.ClaimLaunchReceiptResult{Receipt: &receipt}, nil
+	})
+
+	srv.Handle(ipc.MethodReleaseHeldRun, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		if err := refuseNested(ctx, false); err != nil {
+			return nil, err
+		}
+		var p ipc.ReleaseHeldRunParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		result, err := mgr.HandleReleaseHeldRun(ctx, &p)
+		if err != nil {
+			return nil, err
+		}
+		return &result, nil
 	})
 
 	srv.Handle(ipc.MethodResolvePiProfile, func(ctx context.Context, params json.RawMessage) (interface{}, error) {

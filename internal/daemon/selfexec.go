@@ -584,22 +584,31 @@ func requireManagedSubscriptionDaemon(p *paths.Paths) error {
 	if err != nil {
 		return fmt.Errorf("inspect existing daemon policy: %w", err)
 	}
-	if !result.SubscriptionPolicy {
-		return fmt.Errorf("managed subscription launch refuses an existing unmanaged daemon; stop it before retrying")
-	}
 	expectedFile := os.Getenv("GRIT_SUBSCRIPTION_POLICY_FILE")
 	if !filepath.IsAbs(expectedFile) {
 		return fmt.Errorf("managed subscription launch requires an absolute GRIT_SUBSCRIPTION_POLICY_FILE")
 	}
-	if result.SubscriptionPolicyFile != expectedFile {
+	if !result.SubscriptionPolicy {
+		return fmt.Errorf("managed subscription launch refuses an existing unmanaged daemon; stop it before retrying")
+	}
+	if !samePhysicalPath(result.SubscriptionPolicyFile, expectedFile) {
 		return fmt.Errorf("managed subscription launch refuses daemon with policy file %q (want %q)", result.SubscriptionPolicyFile, expectedFile)
 	}
 	expectedCheck := os.Getenv("GRIT_SUBSCRIPTION_CHECK")
 	if !filepath.IsAbs(expectedCheck) {
 		return fmt.Errorf("managed subscription launch requires an absolute GRIT_SUBSCRIPTION_CHECK")
 	}
-	if result.SubscriptionCheck != expectedCheck {
+	if !samePhysicalPath(result.SubscriptionCheck, expectedCheck) {
 		return fmt.Errorf("managed subscription launch refuses daemon with subscription check %q (want %q)", result.SubscriptionCheck, expectedCheck)
+	}
+	if homeInput := os.Getenv("FM_HOME"); homeInput != "" {
+		expectedHome, err := canonicalPhysicalPath(homeInput)
+		if err != nil {
+			return fmt.Errorf("managed subscription launch requires a resolvable absolute FM_HOME: %w", err)
+		}
+		if result.SubscriptionFirstmateHome != expectedHome {
+			return fmt.Errorf("managed subscription launch refuses daemon pinned to Firstmate home %q (want %q)", result.SubscriptionFirstmateHome, expectedHome)
+		}
 	}
 	return nil
 }
@@ -943,6 +952,9 @@ func upsertEnv(env []string, key, value string) []string {
 
 // EnsureDaemon starts the daemon if it's not already running.
 func EnsureDaemon(p *paths.Paths) error {
+	if managedSubscriptionPolicyActive() && !filepath.IsAbs(os.Getenv("GRIT_SUBSCRIPTION_POLICY_FILE")) {
+		return fmt.Errorf("managed subscription launch requires an absolute GRIT_SUBSCRIPTION_POLICY_FILE")
+	}
 	alive, err := daemonHealthCheck(p)
 	if err != nil {
 		return fmt.Errorf("%w (run 'no-mistakes daemon start' to recover)", err)

@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS runs (
     launch_validation_generation TEXT,
     launch_intent_digest TEXT,
     launch_receipt_claimed_at INTEGER,
+    launch_bind_release_required INTEGER NOT NULL DEFAULT 0,
+    launch_released_at INTEGER,
     pr_base_branch       TEXT,
     pi_profile           TEXT,
     created_at           INTEGER NOT NULL,
@@ -277,6 +279,13 @@ var migrationStatements = []string{
 	// The first successful conditional update marks the sole `created`
 	// observer; all later claims are durable replays.
 	`ALTER TABLE runs ADD COLUMN launch_receipt_claimed_at INTEGER`,
+	// Managed launches that require Captain to bind before execution persist
+	// the requirement at creation. The release timestamp is the durable one-shot
+	// permission; it is never backfilled for historical runs.
+	`ALTER TABLE runs ADD COLUMN launch_bind_release_required INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE runs ADD COLUMN launch_released_at INTEGER`,
+	`CREATE TRIGGER IF NOT EXISTS runs_launch_bind_release_required_immutable BEFORE UPDATE OF launch_bind_release_required ON runs WHEN NEW.launch_bind_release_required IS NOT OLD.launch_bind_release_required BEGIN SELECT RAISE(ABORT, 'run launch bind-release requirement is immutable'); END`,
+	`CREATE TRIGGER IF NOT EXISTS runs_launch_released_at_immutable BEFORE UPDATE OF launch_released_at ON runs WHEN OLD.launch_released_at IS NOT NULL AND NEW.launch_released_at IS NOT OLD.launch_released_at BEGIN SELECT RAISE(ABORT, 'run launch release timestamp is immutable'); END`,
 	// Per-run PR target branch chosen by the operator (e.g. axi run
 	// --base-branch). Nullable: absent means fall back to repo config and the
 	// forge default branch.
